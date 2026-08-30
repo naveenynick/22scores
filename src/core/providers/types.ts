@@ -38,6 +38,8 @@ export interface ProviderQuery {
   until?: Date;
   /** Provider-native handles/ids to scope to (e.g. curated GM usernames). */
   participantRefs?: string[];
+  /** Upper bound on how many competitions a provider should discover. */
+  limit?: number;
 }
 
 export interface SportProvider {

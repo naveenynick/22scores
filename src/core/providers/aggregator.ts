@@ -13,8 +13,9 @@ import { getProviders } from "@/core/providers/registry";
  * skipped for the cycle (existing data persists elsewhere) so the product never
  * depends on a single provider being up.
  *
- * NOTE: no network calls happen yet — providers currently return []. The merge
- * logic is real so ingestion can plug straight in.
+ * NOTE: providers are called concurrently, but each provider serializes its own
+ * outbound requests. Ingestion consumes this API; the web app reads the
+ * database, never this module, on a user request.
  */
 
 /** Normalize a name for cross-provider matching. */
@@ -92,7 +93,16 @@ export async function getEvents(
       .sort()
       .join("|");
     const day = e.startTime ? e.startTime.toISOString().slice(0, 10) : "";
-    return `${e.sport}:${sides}:${day}`;
+    // Participant names are what let two providers agree on the same event.
+    if (sides !== "") return `${e.sport}:${e.kind}:${sides}:${day}`;
+    // Container events (e.g. a chess round) have no sides, so names cannot
+    // identify them: fall back to provenance instead of collapsing unrelated
+    // events onto one key.
+    const refs = e.sources
+      .map((s) => `${s.provider}/${s.providerRef}`)
+      .sort()
+      .join("|");
+    return `${e.sport}:${e.kind}:ref:${refs}:${day}`;
   });
 }
 

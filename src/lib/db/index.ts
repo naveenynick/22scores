@@ -24,3 +24,11 @@ export function getDb(): PostgresJsDatabase<typeof schema> {
 }
 
 export { schema };
+
+/** Close the pool. Only for one-shot scripts; the web app never calls this. */
+export async function closeDb(): Promise<void> {
+  if (client === null) return;
+  await client.end({ timeout: 5 });
+  client = null;
+  db = null;
+}

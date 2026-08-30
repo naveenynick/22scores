@@ -1,14 +1,17 @@
 /**
- * Curated Indian Grandmaster allow-list (chess).
+ * Optional "featured Indian GMs" list (chess).
  *
- * This is the SOURCE OF TRUTH for "which chess players represent India" in the
- * MVP. Neither the Chess.com nor Lichess public API exposes reliable FIDE
- * federation, and we deliberately do NOT build a directory of every Indian
- * player — the MVP focuses on GMs and their activity.
+ * NOT the inclusion filter. India relevance is decided per player from the data
+ * itself — FIDE title "GM" AND federation "IND", as reported by the provider
+ * (see lichess-mapper.ts). A missing title or federation is UNKNOWN, never
+ * "not Indian", so nothing depends on this file being complete.
+ *
+ * It exists only for editorial use (highlighting well-known names) and for
+ * provider-native handle lookups. We deliberately do NOT build a directory of
+ * every Indian player.
  *
  * `fideFederation` is the intended official federation ("IND"); provider
  * usernames are how ingestion matches this GM inside tournament/game payloads.
- * Add or remove entries here to change coverage — no code changes needed.
  */
 export interface IndianGm {
   /** Canonical display name. */

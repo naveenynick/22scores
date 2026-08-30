@@ -90,6 +90,8 @@ export type Competition = z.infer<typeof Competition>;
 export const EventParticipant = z.object({
   participantName: z.string(),
   countryIso2: z.string().length(2).nullable().default(null),
+  /** e.g. "GM" — carried so the participant row can be created from an event. */
+  title: z.string().nullable().default(null),
   /** Sport-specific role, e.g. "home"|"away"|"white"|"black". */
   role: z.string().nullable().default(null),
   score: z.string().nullable().default(null),
