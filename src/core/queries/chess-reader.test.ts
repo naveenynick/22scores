@@ -3,6 +3,7 @@ import postgres from "postgres";
 import { describe, expect, it } from "vitest";
 
 import {
+  competitionRoundsQuery,
   gameSidesQuery,
   gamesQuery,
   tournamentGmsQuery,
@@ -122,6 +123,19 @@ describe("child batch SQL", () => {
     // Country is left joined: an opponent with unknown federation must appear.
     expect(sql).toContain('left join "countries" "participant_country"');
     expect(sql).not.toContain("upper(");
+    expect(isReadOnly(sql)).toBe(true);
+  });
+
+  it("fetches round containers for many competitions in one statement", () => {
+    const { sql, params } = competitionRoundsQuery(db, {
+      competitionIds: ["c1", "c2"],
+    }).toSQL();
+    expect(sql).toContain('from "events"');
+    expect(sql).toContain('"events"."competition_id" in ');
+    expect(params).toEqual(expect.arrayContaining(["c1", "c2", "round"]));
+    // Rounds carry no sides, so nothing is joined to them.
+    expect(sql).not.toContain("join");
+    expect(sql).toContain('"events"."start_time" asc nulls last');
     expect(isReadOnly(sql)).toBe(true);
   });
 });

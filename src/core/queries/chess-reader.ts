@@ -31,13 +31,15 @@ import type { SourceRefRow } from "@/lib/db/schema";
  *    flags an entity for some other reason (a venue, a broadcast language)
  *    cannot leak into a GM feed.
  *
- * Children (entrants, sides) are always fetched for a LIST of parent ids, so
- * there is no N+1 path: each public query is two round trips, whatever the
- * number of rows.
+ * Children (entrants, rounds, sides) are always fetched for a LIST of parent
+ * ids, so there is no N+1 path: a public query is one statement for the parents
+ * and one per child kind, whatever the number of rows.
  */
 
 const CHESS = "chess" as const;
 const GAME_KIND = "game" as const;
+/** A round is a container event: it holds no participants of its own. */
+const ROUND_KIND = "round" as const;
 
 /** The FIDE title that defines chess relevance for this product. */
 const GM_TITLE = "GM";
@@ -103,6 +105,17 @@ export interface GameSideRow {
 }
 
 /**
+ * One round of a tournament. The canonical schema stores rounds as container
+ * events, so a round has a state and a start time but no number or name — the
+ * only place an ordinal exists is a provider URL, which this layer never reads.
+ */
+export interface CompetitionRoundRow {
+  competitionId: string;
+  status: EventStatus;
+  startTime: Date | null;
+}
+
+/**
  * The complete set of reads the chess query layer performs. Production uses
  * `drizzleChessReader`; tests substitute an in-memory implementation, which is
  * what keeps storage detail out of the query functions themselves.
@@ -113,6 +126,9 @@ export interface ChessReader {
     competitionIds: string[];
     countryIso2: string;
   }): Promise<TournamentGmRow[]>;
+  competitionRounds(query: {
+    competitionIds: string[];
+  }): Promise<CompetitionRoundRow[]>;
   games(query: GameQuery): Promise<GameRow[]>;
   gameSides(query: { eventIds: string[] }): Promise<GameSideRow[]>;
 }
@@ -252,6 +268,31 @@ export function tournamentGmsQuery(
     .orderBy(schema.participants.name);
 }
 
+/**
+ * Rounds for MANY competitions at once. Ordered by start so the caller can read
+ * progress off the list without a second statement.
+ */
+export function competitionRoundsQuery(
+  db: Db,
+  query: { competitionIds: string[] },
+) {
+  return db
+    .select({
+      competitionId: schema.events.competitionId,
+      status: schema.events.status,
+      startTime: schema.events.startTime,
+    })
+    .from(schema.events)
+    .where(
+      and(
+        eq(schema.events.sport, CHESS),
+        eq(schema.events.kind, ROUND_KIND),
+        inArray(schema.events.competitionId, query.competitionIds),
+      ),
+    )
+    .orderBy(sql`${schema.events.startTime} asc nulls last`);
+}
+
 export function gamesQuery(db: Db, query: GameQuery) {
   return db
     .select({
@@ -339,6 +380,14 @@ export function drizzleChessReader(db: Db): ChessReader {
     async tournamentGms(query) {
       if (query.competitionIds.length === 0) return [];
       return tournamentGmsQuery(db, query);
+    },
+    async competitionRounds(query) {
+      if (query.competitionIds.length === 0) return [];
+      const rows = await competitionRoundsQuery(db, query);
+      // `inArray` already guarantees a competition, but the column is nullable.
+      return rows.filter(
+        (row): row is CompetitionRoundRow => row.competitionId !== null,
+      );
     },
     async games(query) {
       if (query.statuses.length === 0 || query.limit <= 0) return [];

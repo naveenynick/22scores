@@ -2,18 +2,23 @@ import { describe, expect, it } from "vitest";
 
 import {
   assembleGames,
+  assembleTournaments,
   getChessCountryOverview,
   getIndiaChessOverview,
   getLiveChessGames,
   getOngoingChessTournaments,
   getRecentChessGames,
   getUpcomingChessTournaments,
+  latestFetchedAt,
   normalizeCountryIso2,
   orderSides,
+  summarizeRounds,
   toCanonicalSources,
+  type ChessCountryOverview,
 } from "@/core/queries/chess";
 import type {
   ChessReader,
+  CompetitionRoundRow,
   GameRow,
   GameSideRow,
   TournamentGmRow,
@@ -107,6 +112,14 @@ function side(
   };
 }
 
+function round(
+  competitionId: string,
+  status: CompetitionRoundRow["status"],
+  startTime: Date | null = null,
+): CompetitionRoundRow {
+  return { competitionId, status, startTime };
+}
+
 interface ReaderCall {
   fn: keyof ChessReader;
   args: Record<string, unknown>;
@@ -117,6 +130,7 @@ function fakeReader(
   data: {
     tournaments?: TournamentRow[];
     gms?: TournamentGmRow[];
+    rounds?: CompetitionRoundRow[];
     games?: GameRow[];
     sides?: GameSideRow[];
   } = {},
@@ -132,6 +146,12 @@ function fakeReader(
     async tournamentGms(query) {
       calls.push({ fn: "tournamentGms", args: { ...query } });
       return (data.gms ?? []).filter((row) =>
+        query.competitionIds.includes(row.competitionId),
+      );
+    },
+    async competitionRounds(query) {
+      calls.push({ fn: "competitionRounds", args: { ...query } });
+      return (data.rounds ?? []).filter((row) =>
         query.competitionIds.includes(row.competitionId),
       );
     },
@@ -167,11 +187,22 @@ const GMS = [
   gmRow("c9", "Someone Else"),
 ];
 
+const ROUNDS = [
+  round("c1", "recent", new Date("2026-08-25T09:00:00.000Z")),
+  round("c1", "finished", new Date("2026-08-24T09:00:00.000Z")),
+  round("c1", "live", new Date("2026-08-26T09:00:00.000Z")),
+  round("c1", "upcoming", new Date("2026-08-28T09:00:00.000Z")),
+  round("c1", "upcoming", null),
+  // Same leak guard as the entrants: c9 is never selected.
+  round("c9", "live", new Date("2026-08-26T09:00:00.000Z")),
+];
+
 describe("ongoing tournaments", () => {
   it("asks for ongoing only and fetches all entrants in one batch", async () => {
     const { reader, calls } = fakeReader({
       tournaments: TOURNAMENTS,
       gms: GMS,
+      rounds: ROUNDS,
     });
 
     const result = await getOngoingChessTournaments(reader, {
@@ -179,7 +210,7 @@ describe("ongoing tournaments", () => {
     });
 
     expect(result.map((t) => t.id)).toEqual(["c1", "c2"]);
-    // Two reads for two tournaments — the N+1 guard.
+    // Three reads for two tournaments — the N+1 guard.
     expect(calls).toEqual([
       {
         fn: "tournaments",
@@ -193,6 +224,10 @@ describe("ongoing tournaments", () => {
       {
         fn: "tournamentGms",
         args: { competitionIds: ["c1", "c2"], countryIso2: "IN" },
+      },
+      {
+        fn: "competitionRounds",
+        args: { competitionIds: ["c1", "c2"] },
       },
     ]);
 
@@ -213,6 +248,27 @@ describe("ongoing tournaments", () => {
     expect(result[0]?.sources).toEqual([
       { provider: "lichess", providerRef: "c1", url: null, fetchedAt: FETCHED },
     ]);
+  });
+
+  it("counts each tournament's own rounds and leaves unknown ones null", async () => {
+    const { reader } = fakeReader({
+      tournaments: TOURNAMENTS,
+      rounds: ROUNDS,
+    });
+
+    const result = await getOngoingChessTournaments(reader, {
+      countryIso2: "IN",
+    });
+
+    expect(result[0]?.rounds).toEqual({
+      total: 5,
+      completed: 2,
+      live: 1,
+      upcoming: 2,
+      nextStartTime: new Date("2026-08-26T09:00:00.000Z"),
+    });
+    // c2 has no stored rounds: unknown, not "zero rounds".
+    expect(result[1]?.rounds).toBeNull();
   });
 });
 
@@ -252,6 +308,7 @@ describe("upcoming tournaments", () => {
     });
     expect(result).toHaveLength(1);
     expect(result[0]?.gms).toEqual([]);
+    expect(result[0]?.rounds).toBeNull();
     expect(result[0]?.startDate).toEqual(
       new Date("2026-09-10T09:00:00.000Z"),
     );
@@ -379,10 +436,11 @@ describe("live games", () => {
 });
 
 describe("country overview", () => {
-  it("fills all four sections in six reads, sharing the child batches", async () => {
+  it("fills all four sections in seven reads, sharing the child batches", async () => {
     const { reader, calls } = fakeReader({
       tournaments: TOURNAMENTS,
       gms: GMS,
+      rounds: ROUNDS,
       games: GAMES,
       sides: SIDES,
     });
@@ -397,13 +455,16 @@ describe("country overview", () => {
     expect(overview.recentGames.map((g) => g.id)).toEqual(["g1", "g3"]);
     expect(overview.liveGames.map((g) => g.id)).toEqual(["g2"]);
 
-    // Four parent lists + exactly one entrant batch + exactly one sides batch.
-    expect(calls).toHaveLength(6);
+    // Four parent lists + one batch per child kind, each fetched exactly once.
+    expect(calls).toHaveLength(7);
     expect(calls.filter((c) => c.fn === "tournamentGms")).toEqual([
       {
         fn: "tournamentGms",
         args: { competitionIds: ["c1", "c2", "c3"], countryIso2: "IN" },
       },
+    ]);
+    expect(calls.filter((c) => c.fn === "competitionRounds")).toEqual([
+      { fn: "competitionRounds", args: { competitionIds: ["c1", "c2", "c3"] } },
     ]);
     expect(calls.filter((c) => c.fn === "gameSides")).toEqual([
       { fn: "gameSides", args: { eventIds: ["g2", "g1", "g3"] } },
@@ -414,9 +475,11 @@ describe("country overview", () => {
       "Narayanan S L",
       "Puranik, Abhimanyu",
     ]);
+    expect(overview.ongoingTournaments[0]?.rounds?.total).toBe(5);
     expect(overview.upcomingTournaments[0]?.gms.map((g) => g.name)).toEqual([
       "Erigaisi Arjun",
     ]);
+    expect(overview.upcomingTournaments[0]?.rounds).toBeNull();
     expect(overview.liveGames[0]?.sides).toHaveLength(2);
   });
 
@@ -472,5 +535,81 @@ describe("pure helpers", () => {
     const [assembled] = assembleGames([game("gz", "upcoming", null)], [], "IN");
     expect(assembled?.sides).toEqual([]);
     expect(assembled?.result).toBeNull();
+  });
+
+  it("reports no round progress rather than zero rounds", () => {
+    expect(summarizeRounds([])).toBeNull();
+  });
+
+  it("prefers an upcoming start only when no round is live", () => {
+    expect(
+      summarizeRounds([
+        round("c1", "upcoming", new Date("2026-09-02T09:00:00.000Z")),
+        round("c1", "upcoming", new Date("2026-09-01T09:00:00.000Z")),
+      ]),
+    ).toEqual({
+      total: 2,
+      completed: 0,
+      live: 0,
+      upcoming: 2,
+      nextStartTime: new Date("2026-09-01T09:00:00.000Z"),
+    });
+  });
+
+  it("keeps the next start null when no round has a time", () => {
+    expect(summarizeRounds([round("c1", "live"), round("c1", "upcoming")])
+      ?.nextStartTime).toBeNull();
+  });
+
+  it("reports the newest fetch across every section", () => {
+    const older = "2026-08-31T10:00:00.000Z";
+    const newest = "2026-08-31T13:30:00.000Z";
+    const [ongoing] = assembleTournaments(
+      [tournament("c1", "ongoing")],
+      [],
+      [],
+      "IN",
+    );
+    const [recent] = assembleGames([game("g1", "recent", "1-0")], [], "IN");
+    const empty: ChessCountryOverview = {
+      countryIso2: "IN",
+      ongoingTournaments: [],
+      upcomingTournaments: [],
+      recentGames: [],
+      liveGames: [],
+    };
+
+    expect(latestFetchedAt(empty)).toBeNull();
+    expect(
+      latestFetchedAt({
+        ...empty,
+        ongoingTournaments: ongoing
+          ? [
+              {
+                ...ongoing,
+                sources: [
+                  { provider: "p", providerRef: "a", url: null, fetchedAt: older },
+                ],
+              },
+            ]
+          : [],
+        recentGames: recent
+          ? [
+              {
+                ...recent,
+                sources: [
+                  {
+                    provider: "p",
+                    providerRef: "b",
+                    url: null,
+                    fetchedAt: newest,
+                  },
+                  { provider: "p", providerRef: "c", url: null, fetchedAt: older },
+                ],
+              },
+            ]
+          : [],
+      }),
+    ).toBe(newest);
   });
 });

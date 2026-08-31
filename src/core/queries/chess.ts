@@ -7,6 +7,7 @@ import type {
 import {
   drizzleChessReader,
   type ChessReader,
+  type CompetitionRoundRow,
   type GameRow,
   type GameSideRow,
   type SortOrder,
@@ -30,8 +31,8 @@ import type { SourceRefRow } from "@/lib/db/schema";
  *  - relevance means a CONFIRMED fact — FIDE title GM plus that country's
  *    federation, as already normalized into `participants` — never a guess;
  *  - nothing is invented: a missing date, result or federation stays null;
- *  - two database round trips per query (parents, then all children in one
- *    batch), six for the whole overview. There is no per-row query anywhere.
+ *  - children are batched: parents first, then every child kind fetched once for
+ *    the whole page of parents. Two sequential phases per query, never per row.
  *
  * Storage access is injected as a `ChessReader`, so these functions can be
  * tested without a database and a different store could back them later.
@@ -58,6 +59,23 @@ export interface ChessTournamentGm {
   finalRank: number | null;
 }
 
+/**
+ * How far a tournament has got, counted from its stored round events.
+ *
+ * Deliberately counts rather than numbers the rounds: the canonical schema has
+ * no round ordinal, so "round 4 of 7" would be an inference. `null` in place of
+ * this object means "no rounds recorded", which is not the same as zero rounds.
+ */
+export interface ChessRoundProgress {
+  total: number;
+  /** Rounds already played ("recent" or "finished"). */
+  completed: number;
+  live: number;
+  upcoming: number;
+  /** Start of the live round, else of the soonest upcoming one. */
+  nextStartTime: Date | null;
+}
+
 export interface ChessTournament {
   id: string;
   name: string;
@@ -69,6 +87,8 @@ export interface ChessTournament {
   relevantCountryIso2: string;
   /** Confirmed GMs from that country. Empty means "not known yet", not "none". */
   gms: ChessTournamentGm[];
+  /** Round progress, or null when no rounds are recorded. */
+  rounds: ChessRoundProgress | null;
   sources: CanonicalSource[];
 }
 
@@ -141,6 +161,33 @@ export function toCanonicalSources(
   }));
 }
 
+/**
+ * Newest provenance timestamp anywhere in an overview — when the data on screen
+ * was last confirmed. Null when nothing carries provenance.
+ */
+export function latestFetchedAt(overview: ChessCountryOverview): string | null {
+  let latest: string | null = null;
+  let latestMs = Number.NEGATIVE_INFINITY;
+  const consider = (sources: CanonicalSource[]): void => {
+    for (const source of sources) {
+      const ms = Date.parse(source.fetchedAt);
+      if (Number.isNaN(ms) || ms <= latestMs) continue;
+      latestMs = ms;
+      latest = source.fetchedAt;
+    }
+  };
+  for (const tournament of [
+    ...overview.ongoingTournaments,
+    ...overview.upcomingTournaments,
+  ]) {
+    consider(tournament.sources);
+  }
+  for (const game of [...overview.liveGames, ...overview.recentGames]) {
+    consider(game.sources);
+  }
+  return latest;
+}
+
 function groupBy<T>(rows: T[], keyOf: (row: T) => string): Map<string, T[]> {
   const grouped = new Map<string, T[]>();
   for (const row of rows) {
@@ -168,12 +215,55 @@ export function orderSides(sides: ChessGameSide[]): ChessGameSide[] {
     .map(({ side }) => side);
 }
 
+/** Earliest of two possibly-missing times. */
+function earlier(current: Date | null, candidate: Date | null): Date | null {
+  if (candidate === null) return current;
+  if (current === null) return candidate;
+  return candidate < current ? candidate : current;
+}
+
+/**
+ * Count round states for one competition. Returns null for an empty list so a
+ * tournament with no stored rounds reads as "unknown" rather than "no rounds".
+ */
+export function summarizeRounds(
+  rows: CompetitionRoundRow[],
+): ChessRoundProgress | null {
+  if (rows.length === 0) return null;
+  let completed = 0;
+  let live = 0;
+  let upcoming = 0;
+  let liveStart: Date | null = null;
+  let nextUpcoming: Date | null = null;
+  for (const row of rows) {
+    if (row.status === "live") {
+      live += 1;
+      liveStart = earlier(liveStart, row.startTime);
+    } else if (row.status === "upcoming") {
+      upcoming += 1;
+      nextUpcoming = earlier(nextUpcoming, row.startTime);
+    } else {
+      // "recent" and "finished" both mean the round has been played.
+      completed += 1;
+    }
+  }
+  return {
+    total: rows.length,
+    completed,
+    live,
+    upcoming,
+    nextStartTime: liveStart ?? nextUpcoming,
+  };
+}
+
 export function assembleTournaments(
   rows: TournamentRow[],
   gmRows: TournamentGmRow[],
+  roundRows: CompetitionRoundRow[],
   countryIso2: string,
 ): ChessTournament[] {
   const byCompetition = groupBy(gmRows, (row) => row.competitionId);
+  const roundsByCompetition = groupBy(roundRows, (row) => row.competitionId);
   return rows.map((row) => ({
     id: row.id,
     name: row.name,
@@ -189,6 +279,7 @@ export function assembleTournaments(
       entryStatus: gm.entryStatus,
       finalRank: gm.finalRank,
     })),
+    rounds: summarizeRounds(roundsByCompetition.get(row.id) ?? []),
     sources: toCanonicalSources(row.sources),
   }));
 }
@@ -253,11 +344,14 @@ export async function getRelevantChessTournaments(
     limit: options.limit ?? DEFAULT_LIMIT,
   });
   if (rows.length === 0) return [];
-  const gmRows = await reader.tournamentGms({
-    competitionIds: uniqueIds(rows),
-    countryIso2,
-  });
-  return assembleTournaments(rows, gmRows, countryIso2);
+  const competitionIds = uniqueIds(rows);
+  // Entrants and rounds are independent children: one statement each, in
+  // parallel, for the whole page of tournaments.
+  const [gmRows, roundRows] = await Promise.all([
+    reader.tournamentGms({ competitionIds, countryIso2 }),
+    reader.competitionRounds({ competitionIds }),
+  ]);
+  return assembleTournaments(rows, gmRows, roundRows, countryIso2);
 }
 
 export async function getRelevantChessGames(
@@ -329,9 +423,10 @@ export function getLiveChessGames(
 }
 
 /**
- * All four sections in six round trips: the four parent lists concurrently,
- * then entrants and sides each fetched once for the union of parent ids.
- * Calling the four functions above separately would cost eight.
+ * All four sections in two sequential phases: the four parent lists
+ * concurrently, then entrants, rounds and sides each fetched once for the union
+ * of parent ids. Calling the four functions above separately would repeat the
+ * child batches.
  */
 export async function getChessCountryOverview(
   source: ChessDataSource,
@@ -371,10 +466,13 @@ export async function getChessCountryOverview(
   const competitionIds = uniqueIds([...ongoingRows, ...upcomingRows]);
   const eventIds = uniqueIds([...liveRows, ...recentRows]);
 
-  const [gmRows, sideRows] = await Promise.all([
+  const [gmRows, roundRows, sideRows] = await Promise.all([
     competitionIds.length === 0
       ? Promise.resolve<TournamentGmRow[]>([])
       : reader.tournamentGms({ competitionIds, countryIso2 }),
+    competitionIds.length === 0
+      ? Promise.resolve<CompetitionRoundRow[]>([])
+      : reader.competitionRounds({ competitionIds }),
     eventIds.length === 0
       ? Promise.resolve<GameSideRow[]>([])
       : reader.gameSides({ eventIds }),
@@ -382,8 +480,18 @@ export async function getChessCountryOverview(
 
   return {
     countryIso2,
-    ongoingTournaments: assembleTournaments(ongoingRows, gmRows, countryIso2),
-    upcomingTournaments: assembleTournaments(upcomingRows, gmRows, countryIso2),
+    ongoingTournaments: assembleTournaments(
+      ongoingRows,
+      gmRows,
+      roundRows,
+      countryIso2,
+    ),
+    upcomingTournaments: assembleTournaments(
+      upcomingRows,
+      gmRows,
+      roundRows,
+      countryIso2,
+    ),
     recentGames: assembleGames(recentRows, sideRows, countryIso2),
     liveGames: assembleGames(liveRows, sideRows, countryIso2),
   };
