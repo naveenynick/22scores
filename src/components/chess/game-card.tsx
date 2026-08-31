@@ -1,7 +1,12 @@
 import type { ChessGame, ChessGameSide } from "@/core/queries/chess";
 import { EventStatusBadge } from "@/components/chess/status-badge";
 import { Badge } from "@/components/ui/badge";
+import { ExternalEventLinkButton } from "@/components/ui/external-link-button";
 import { cn } from "@/lib/utils";
+import {
+  CHESS_GAME_LINK_LABELS,
+  resolveExternalEventLink,
+} from "@/lib/external-links";
 import { formatDayTime, toIsoAttribute } from "@/lib/format";
 
 /**
@@ -12,6 +17,16 @@ import { formatDayTime, toIsoAttribute } from "@/lib/format";
  * The side from the country being viewed is highlighted in place rather than
  * moved to the top: board order is a fact, and reordering it would hide who had
  * white.
+ *
+ * A game the data still calls live but the query layer could not confirm is
+ * presented as *last seen in progress*: no pulsing badge, no "Watch now", no
+ * invented result, and no claim that it finished. Only the confidence changes —
+ * see `@/core/queries/freshness`.
+ *
+ * The card itself is not a link. The provenance URL leads off-site, and one
+ * outbound action ("Watch now" while live, "View game" once over) is easier to
+ * reach by keyboard and to describe than a card-sized target wrapped around the
+ * player rows. It appears only when the stored source can be trusted.
  */
 export function GameCard({
   game,
@@ -20,23 +35,44 @@ export function GameCard({
   game: ChessGame;
   countryIso2: string;
 }) {
-  const isLive = game.status === "live";
+  const claim = game.liveClaim;
+  // Confirmed live only: "Watch now" and the live tint must never appear on a
+  // row whose live claim has aged out.
+  const isLive = claim?.confidence === "confirmed";
+  const isUnconfirmed = claim?.confidence === "unconfirmed";
+  // Only worth printing when the claim is the thing in doubt; a confirmed row's
+  // fetch time is already covered by the page's own "updated" line.
+  const lastSeenAt = isUnconfirmed ? (claim?.lastSeenAt ?? null) : null;
+  const link = resolveExternalEventLink({
+    sources: game.sources,
+    isLive,
+    labels: CHESS_GAME_LINK_LABELS,
+    context: gameSubject(game),
+  });
 
   return (
     <li
       className={cn(
         "overflow-hidden rounded-xl border bg-card shadow-sm",
         isLive && "border-rose-200 ring-1 ring-rose-100",
+        isUnconfirmed && "border-amber-200",
       )}
     >
       <article>
         <div
           className={cn(
             "flex items-center gap-2 border-b px-3 py-2 sm:px-4",
-            isLive ? "bg-rose-50/70" : "bg-muted/40",
+            isLive
+              ? "bg-rose-50/70"
+              : isUnconfirmed
+                ? "bg-amber-50/60"
+                : "bg-muted/40",
           )}
         >
-          <EventStatusBadge status={game.status} />
+          <EventStatusBadge
+            status={game.status}
+            liveConfidence={claim?.confidence ?? null}
+          />
           <h3 className="min-w-0 flex-1 truncate text-xs font-medium text-muted-foreground">
             {game.competitionName ?? "Tournament not recorded"}
           </h3>
@@ -58,36 +94,63 @@ export function GameCard({
           </ul>
         )}
 
-        <footer className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 border-t bg-muted/20 px-3 py-2 text-xs sm:px-4">
-          <p>
-            {game.result !== null ? (
-              <>
-                <span className="text-muted-foreground">Result </span>
-                <span className="font-bold tabular-nums">{game.result}</span>
-              </>
-            ) : (
-              <span
-                className={cn(
-                  "font-semibold",
-                  isLive ? "text-rose-700" : "text-muted-foreground",
-                )}
-              >
-                {isLive ? "In progress" : "Result not recorded"}
-              </span>
-            )}
-          </p>
-          {game.startTime !== null && (
-            <p className="text-muted-foreground">
-              {game.status === "upcoming" ? "Starts " : "Started "}
-              <time dateTime={toIsoAttribute(game.startTime)}>
-                {formatDayTime(game.startTime)}
-              </time>
+        <footer className="flex flex-wrap items-center gap-x-3 gap-y-2 border-t bg-muted/20 px-3 py-2.5 text-xs sm:px-4">
+          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-3 gap-y-1">
+            <p>
+              {game.result !== null ? (
+                <>
+                  <span className="text-muted-foreground">Result </span>
+                  <span className="font-bold tabular-nums">{game.result}</span>
+                </>
+              ) : isLive ? (
+                <span className="font-semibold text-rose-700">In progress</span>
+              ) : isUnconfirmed ? (
+                // Not "Result not recorded", which reads as a finished game with
+                // a missing score. Nothing here is known to have finished.
+                <span className="font-semibold text-amber-800">
+                  Last seen in progress
+                </span>
+              ) : (
+                <span className="font-semibold text-muted-foreground">
+                  Result not recorded
+                </span>
+              )}
             </p>
-          )}
+            {game.startTime !== null && (
+              <p className="text-muted-foreground">
+                {game.status === "upcoming" ? "Starts " : "Started "}
+                <time dateTime={toIsoAttribute(game.startTime)}>
+                  {formatDayTime(game.startTime)}
+                </time>
+              </p>
+            )}
+            {lastSeenAt !== null && (
+              <p className="text-muted-foreground">
+                Not confirmed since{" "}
+                <time dateTime={toIsoAttribute(lastSeenAt)}>
+                  {formatDayTime(lastSeenAt)}
+                </time>
+              </p>
+            )}
+          </div>
+          {link !== null && <ExternalEventLinkButton link={link} />}
         </footer>
       </article>
     </li>
   );
+}
+
+/**
+ * What the outbound link leads to, for its accessible name. Built only from
+ * recorded values, so it shortens to the players or the tournament alone rather
+ * than filling a gap.
+ */
+function gameSubject(game: ChessGame): string | null {
+  const players = game.sides.map((side) => side.name).join(" vs ");
+  if (game.competitionName === null) return players === "" ? null : players;
+  return players === ""
+    ? game.competitionName
+    : `${players} at ${game.competitionName}`;
 }
 
 const SIDE_RESULT_LABEL: Record<string, string> = {

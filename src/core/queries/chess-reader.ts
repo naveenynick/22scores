@@ -108,11 +108,16 @@ export interface GameSideRow {
  * One round of a tournament. The canonical schema stores rounds as container
  * events, so a round has a state and a start time but no number or name — the
  * only place an ordinal exists is a provider URL, which this layer never reads.
+ *
+ * `sources` is carried for the same reason a game's is: a round stored as "live"
+ * is a snapshot, and the freshness rule needs its fetch time to know whether
+ * that claim can still be believed.
  */
 export interface CompetitionRoundRow {
   competitionId: string;
   status: EventStatus;
   startTime: Date | null;
+  sources: SourceRefRow[];
 }
 
 /**
@@ -281,6 +286,7 @@ export function competitionRoundsQuery(
       competitionId: schema.events.competitionId,
       status: schema.events.status,
       startTime: schema.events.startTime,
+      sources: schema.events.sources,
     })
     .from(schema.events)
     .where(

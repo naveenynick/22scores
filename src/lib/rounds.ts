@@ -8,7 +8,12 @@ import type { ChessRoundProgress } from "@/core/queries/chess";
  * progress, then the rest) purely so progress can be seen at a glance.
  */
 
-export type RoundSegmentState = "completed" | "live" | "upcoming";
+export type RoundSegmentState =
+  | "completed"
+  | "live"
+  /** Stored as live, no longer confirmed — drawn apart from both neighbours. */
+  | "live-unconfirmed"
+  | "upcoming";
 
 /** Above this, one marker per round stops being readable on a phone. */
 export const MAX_ROUND_SEGMENTS = 15;
@@ -21,12 +26,13 @@ export const MAX_ROUND_SEGMENTS = 15;
 export function roundSegments(
   rounds: ChessRoundProgress,
 ): RoundSegmentState[] | null {
-  const { total, completed, live, upcoming } = rounds;
+  const { total, completed, live, liveUnconfirmed, upcoming } = rounds;
   if (total < 1 || total > MAX_ROUND_SEGMENTS) return null;
-  if (completed + live + upcoming !== total) return null;
+  if (completed + live + liveUnconfirmed + upcoming !== total) return null;
   return [
     ...(Array<RoundSegmentState>(completed).fill("completed")),
     ...(Array<RoundSegmentState>(live).fill("live")),
+    ...(Array<RoundSegmentState>(liveUnconfirmed).fill("live-unconfirmed")),
     ...(Array<RoundSegmentState>(upcoming).fill("upcoming")),
   ];
 }

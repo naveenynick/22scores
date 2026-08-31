@@ -14,6 +14,11 @@ import {
   type TournamentGmRow,
   type TournamentRow,
 } from "@/core/queries/chess-reader";
+import {
+  isConfirmedLive,
+  liveClaimFor,
+  type LiveClaim,
+} from "@/core/queries/freshness";
 import type { SourceRefRow } from "@/lib/db/schema";
 
 /**
@@ -31,6 +36,10 @@ import type { SourceRefRow } from "@/lib/db/schema";
  *  - relevance means a CONFIRMED fact — FIDE title GM plus that country's
  *    federation, as already normalized into `participants` — never a guess;
  *  - nothing is invented: a missing date, result or federation stays null;
+ *  - a stored `status = "live"` is a snapshot, not a fact about now. Every read
+ *    path runs it through `@/core/queries/freshness`, so a live claim whose
+ *    provenance has gone stale is reported as unconfirmed instead of live. It is
+ *    never relabelled finished and never given a result;
  *  - children are batched: parents first, then every child kind fetched once for
  *    the whole page of parents. Two sequential phases per query, never per row.
  *
@@ -39,6 +48,9 @@ import type { SourceRefRow } from "@/lib/db/schema";
  */
 
 // --- Public shapes (canonical application data) ------------------------------
+
+/** Re-exported so a UI can describe a live claim without a second import. */
+export type { LiveClaim, LiveConfidence } from "@/core/queries/freshness";
 
 /** Provenance for a canonical row, trimmed to what a client may need. */
 export interface CanonicalSource {
@@ -70,9 +82,16 @@ export interface ChessRoundProgress {
   total: number;
   /** Rounds already played ("recent" or "finished"). */
   completed: number;
+  /** Rounds in progress whose live claim is still fresh. */
   live: number;
+  /**
+   * Rounds stored as live whose provenance has gone stale — last seen in
+   * progress. Counted separately from both `live` and `completed`, because
+   * neither is known to be true. `total` is the sum of all four buckets.
+   */
+  liveUnconfirmed: number;
   upcoming: number;
-  /** Start of the live round, else of the soonest upcoming one. */
+  /** Start of a confirmed live round, else of the soonest upcoming one. */
   nextStartTime: Date | null;
 }
 
@@ -107,6 +126,7 @@ export interface ChessGameSide {
 
 export interface ChessGame {
   id: string;
+  /** Stored canonical status, verbatim. For "live", read `liveClaim` too. */
   status: EventStatus;
   startTime: Date | null;
   /** Game-level summary, e.g. "1-0". Null while undecided. */
@@ -115,6 +135,12 @@ export interface ChessGame {
   relevantCountryIso2: string;
   sides: ChessGameSide[];
   sources: CanonicalSource[];
+  /**
+   * Present only when `status` is "live": whether that claim is still backed by
+   * a recent fetch. "unconfirmed" means last seen in progress — the game is NOT
+   * known to have finished, and `result` stays null.
+   */
+  liveClaim: LiveClaim | null;
 }
 
 export interface ChessCountryOverview {
@@ -122,7 +148,14 @@ export interface ChessCountryOverview {
   ongoingTournaments: ChessTournament[];
   upcomingTournaments: ChessTournament[];
   recentGames: ChessGame[];
+  /** Games confirmed in progress: stored live AND freshly fetched. */
   liveGames: ChessGame[];
+  /**
+   * Games stored as live whose provenance has gone stale. Kept out of
+   * `liveGames` so nothing claims to be happening now, and out of `recentGames`
+   * so no finished result is implied. Empty in the healthy case.
+   */
+  unconfirmedGames: ChessGame[];
 }
 
 // --- Configuration ----------------------------------------------------------
@@ -182,7 +215,11 @@ export function latestFetchedAt(overview: ChessCountryOverview): string | null {
   ]) {
     consider(tournament.sources);
   }
-  for (const game of [...overview.liveGames, ...overview.recentGames]) {
+  for (const game of [
+    ...overview.liveGames,
+    ...overview.unconfirmedGames,
+    ...overview.recentGames,
+  ]) {
     consider(game.sources);
   }
   return latest;
@@ -225,20 +262,30 @@ function earlier(current: Date | null, candidate: Date | null): Date | null {
 /**
  * Count round states for one competition. Returns null for an empty list so a
  * tournament with no stored rounds reads as "unknown" rather than "no rounds".
+ *
+ * A round stored as live gets the same freshness guard as a game: once its fetch
+ * has aged out it is counted as `liveUnconfirmed`, so the tournament stops
+ * advertising a round in progress without being credited with having played it.
  */
 export function summarizeRounds(
   rows: CompetitionRoundRow[],
+  now: Date,
 ): ChessRoundProgress | null {
   if (rows.length === 0) return null;
   let completed = 0;
   let live = 0;
+  let liveUnconfirmed = 0;
   let upcoming = 0;
   let liveStart: Date | null = null;
   let nextUpcoming: Date | null = null;
   for (const row of rows) {
     if (row.status === "live") {
-      live += 1;
-      liveStart = earlier(liveStart, row.startTime);
+      if (isConfirmedLive({ status: row.status, sources: row.sources }, now)) {
+        live += 1;
+        liveStart = earlier(liveStart, row.startTime);
+      } else {
+        liveUnconfirmed += 1;
+      }
     } else if (row.status === "upcoming") {
       upcoming += 1;
       nextUpcoming = earlier(nextUpcoming, row.startTime);
@@ -251,6 +298,7 @@ export function summarizeRounds(
     total: rows.length,
     completed,
     live,
+    liveUnconfirmed,
     upcoming,
     nextStartTime: liveStart ?? nextUpcoming,
   };
@@ -261,6 +309,7 @@ export function assembleTournaments(
   gmRows: TournamentGmRow[],
   roundRows: CompetitionRoundRow[],
   countryIso2: string,
+  now: Date,
 ): ChessTournament[] {
   const byCompetition = groupBy(gmRows, (row) => row.competitionId);
   const roundsByCompetition = groupBy(roundRows, (row) => row.competitionId);
@@ -279,7 +328,7 @@ export function assembleTournaments(
       entryStatus: gm.entryStatus,
       finalRank: gm.finalRank,
     })),
-    rounds: summarizeRounds(roundsByCompetition.get(row.id) ?? []),
+    rounds: summarizeRounds(roundsByCompetition.get(row.id) ?? [], now),
     sources: toCanonicalSources(row.sources),
   }));
 }
@@ -288,6 +337,7 @@ export function assembleGames(
   rows: GameRow[],
   sideRows: GameSideRow[],
   countryIso2: string,
+  now: Date,
 ): ChessGame[] {
   const byEvent = groupBy(sideRows, (row) => row.eventId);
   return rows.map((row) => ({
@@ -309,7 +359,18 @@ export function assembleGames(
       })),
     ),
     sources: toCanonicalSources(row.sources),
+    liveClaim: liveClaimFor({ status: row.status, sources: row.sources }, now),
   }));
+}
+
+/** Games this layer will present as in progress right now. */
+function confirmedLive(games: ChessGame[]): ChessGame[] {
+  return games.filter((game) => game.liveClaim?.confidence === "confirmed");
+}
+
+/** Games stored as live whose live claim can no longer be believed. */
+function unconfirmedLive(games: ChessGame[]): ChessGame[] {
+  return games.filter((game) => game.liveClaim?.confidence === "unconfirmed");
 }
 
 // --- Query functions --------------------------------------------------------
@@ -326,6 +387,11 @@ function readerFor(source: ChessDataSource): ChessReader {
 export interface CountryLimitOptions {
   countryIso2: string;
   limit?: number;
+  /**
+   * Read clock, used only for the live-freshness decision. Defaults to the
+   * current time; injected by tests so the guard is deterministic.
+   */
+  now?: Date;
 }
 
 export async function getRelevantChessTournaments(
@@ -337,6 +403,7 @@ export async function getRelevantChessTournaments(
 ): Promise<ChessTournament[]> {
   const reader = readerFor(source);
   const countryIso2 = normalizeCountryIso2(options.countryIso2);
+  const now = options.now ?? new Date();
   const rows = await reader.tournaments({
     countryIso2,
     statuses: options.statuses,
@@ -351,7 +418,7 @@ export async function getRelevantChessTournaments(
     reader.tournamentGms({ competitionIds, countryIso2 }),
     reader.competitionRounds({ competitionIds }),
   ]);
-  return assembleTournaments(rows, gmRows, roundRows, countryIso2);
+  return assembleTournaments(rows, gmRows, roundRows, countryIso2, now);
 }
 
 export async function getRelevantChessGames(
@@ -363,6 +430,7 @@ export async function getRelevantChessGames(
 ): Promise<ChessGame[]> {
   const reader = readerFor(source);
   const countryIso2 = normalizeCountryIso2(options.countryIso2);
+  const now = options.now ?? new Date();
   const rows = await reader.games({
     countryIso2,
     statuses: options.statuses,
@@ -371,7 +439,7 @@ export async function getRelevantChessGames(
   });
   if (rows.length === 0) return [];
   const sideRows = await reader.gameSides({ eventIds: uniqueIds(rows) });
-  return assembleGames(rows, sideRows, countryIso2);
+  return assembleGames(rows, sideRows, countryIso2, now);
 }
 
 /** 1. Tournaments under way right now, most recently started first. */
@@ -410,8 +478,36 @@ export function getRecentChessGames(
   });
 }
 
-/** 4. Games in progress. Result stays null until the provider reports one. */
-export function getLiveChessGames(
+/**
+ * 4. Games confirmed in progress. Result stays null until the provider reports
+ * one.
+ *
+ * Both this and `getUnconfirmedChessGames` read the same stored-live rows and
+ * split them by freshness, so `limit` bounds the rows read, not the rows
+ * returned: a page of live rows that has gone stale yields fewer here and the
+ * remainder there.
+ */
+export async function getLiveChessGames(
+  source: ChessDataSource,
+  options: CountryLimitOptions,
+): Promise<ChessGame[]> {
+  return confirmedLive(await getStoredLiveChessGames(source, options));
+}
+
+/**
+ * Games last seen in progress but no longer confirmed. Deliberately a separate
+ * feed rather than a flag on the live one: a caller that only asks for live
+ * games must never be handed a stale row by accident.
+ */
+export async function getUnconfirmedChessGames(
+  source: ChessDataSource,
+  options: CountryLimitOptions,
+): Promise<ChessGame[]> {
+  return unconfirmedLive(await getStoredLiveChessGames(source, options));
+}
+
+/** Every row whose stored status is "live", both fresh and stale. */
+function getStoredLiveChessGames(
   source: ChessDataSource,
   options: CountryLimitOptions,
 ): Promise<ChessGame[]> {
@@ -435,6 +531,9 @@ export async function getChessCountryOverview(
   const reader = readerFor(source);
   const countryIso2 = normalizeCountryIso2(options.countryIso2);
   const limit = options.limit ?? DEFAULT_LIMIT;
+  // One clock for the whole overview, so every section answers "live?" against
+  // the same instant.
+  const now = options.now ?? new Date();
 
   const [ongoingRows, upcomingRows, liveRows, recentRows] = await Promise.all([
     reader.tournaments({
@@ -478,6 +577,8 @@ export async function getChessCountryOverview(
       : reader.gameSides({ eventIds }),
   ]);
 
+  const storedLive = assembleGames(liveRows, sideRows, countryIso2, now);
+
   return {
     countryIso2,
     ongoingTournaments: assembleTournaments(
@@ -485,25 +586,31 @@ export async function getChessCountryOverview(
       gmRows,
       roundRows,
       countryIso2,
+      now,
     ),
     upcomingTournaments: assembleTournaments(
       upcomingRows,
       gmRows,
       roundRows,
       countryIso2,
+      now,
     ),
-    recentGames: assembleGames(recentRows, sideRows, countryIso2),
-    liveGames: assembleGames(liveRows, sideRows, countryIso2),
+    recentGames: assembleGames(recentRows, sideRows, countryIso2, now),
+    // One read of the stored-live rows, split by the freshness rule. A stale row
+    // appears in exactly one of these, never in `recentGames`.
+    liveGames: confirmedLive(storedLive),
+    unconfirmedGames: unconfirmedLive(storedLive),
   };
 }
 
 /** India-first convenience wrapper — the only place "IN" is assumed. */
 export function getIndiaChessOverview(
   source: ChessDataSource,
-  options: { limit?: number } = {},
+  options: { limit?: number; now?: Date } = {},
 ): Promise<ChessCountryOverview> {
   return getChessCountryOverview(source, {
     countryIso2: INDIA_ISO2,
     limit: options.limit,
+    now: options.now,
   });
 }

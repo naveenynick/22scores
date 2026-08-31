@@ -8,6 +8,7 @@ import {
   getLiveChessGames,
   getOngoingChessTournaments,
   getRecentChessGames,
+  getUnconfirmedChessGames,
   getUpcomingChessTournaments,
   latestFetchedAt,
   normalizeCountryIso2,
@@ -24,16 +25,25 @@ import type {
   TournamentGmRow,
   TournamentRow,
 } from "@/core/queries/chess-reader";
+import { LIVE_FRESHNESS_WINDOW_MS } from "@/core/queries/freshness";
 
 /**
  * The query layer is tested through an in-memory `ChessReader`, so these tests
  * assert the things the layer is actually responsible for: which statuses it
  * asks for, that children are fetched in ONE batch (no N+1), how rows are
- * assembled, and that nothing is invented. The reader's SQL is exercised
- * against the live database by the /api/india/chess endpoint.
+ * assembled, that a stale live claim is never presented as live, and that
+ * nothing is invented. The reader's SQL is exercised against the live database by
+ * the /api/india/chess endpoint.
+ *
+ * Every test that touches liveness injects `NOW`, so the freshness guard is
+ * decided by the fixture rather than by the wall clock.
  */
 
 const FETCHED = "2026-08-31T12:00:05.000Z";
+/** Read clock: five minutes after `FETCHED`, well inside the live window. */
+const NOW = new Date("2026-08-31T12:05:00.000Z");
+/** 65 minutes before `NOW` — outside any window in the 20–30 minute range. */
+const STALE_FETCHED = "2026-08-31T11:00:00.000Z";
 
 function tournament(
   id: string,
@@ -71,6 +81,7 @@ function game(
   status: GameRow["status"],
   result: string | null,
   startTime: Date | null = null,
+  fetchedAt: string = FETCHED,
 ): GameRow {
   return {
     id,
@@ -82,7 +93,7 @@ function game(
       {
         provider: "lichess",
         providerRef: `rnd1/${id}`,
-        fetchedAt: FETCHED,
+        fetchedAt,
         url: `https://lichess.org/broadcast/${id}`,
       },
     ],
@@ -116,8 +127,16 @@ function round(
   competitionId: string,
   status: CompetitionRoundRow["status"],
   startTime: Date | null = null,
+  fetchedAt: string = FETCHED,
 ): CompetitionRoundRow {
-  return { competitionId, status, startTime };
+  return {
+    competitionId,
+    status,
+    startTime,
+    sources: [
+      { provider: "lichess", providerRef: `${competitionId}/round`, fetchedAt },
+    ],
+  };
 }
 
 interface ReaderCall {
@@ -207,6 +226,7 @@ describe("ongoing tournaments", () => {
 
     const result = await getOngoingChessTournaments(reader, {
       countryIso2: "in", // lower case on purpose
+      now: NOW,
     });
 
     expect(result.map((t) => t.id)).toEqual(["c1", "c2"]);
@@ -258,17 +278,47 @@ describe("ongoing tournaments", () => {
 
     const result = await getOngoingChessTournaments(reader, {
       countryIso2: "IN",
+      now: NOW,
     });
 
     expect(result[0]?.rounds).toEqual({
       total: 5,
       completed: 2,
       live: 1,
+      liveUnconfirmed: 0,
       upcoming: 2,
       nextStartTime: new Date("2026-08-26T09:00:00.000Z"),
     });
     // c2 has no stored rounds: unknown, not "zero rounds".
     expect(result[1]?.rounds).toBeNull();
+  });
+
+  it("counts a round whose live claim went stale apart from played rounds", async () => {
+    const { reader } = fakeReader({
+      tournaments: TOURNAMENTS,
+      rounds: [
+        round("c1", "finished", new Date("2026-08-24T09:00:00.000Z")),
+        // Stored live, last fetched over an hour ago.
+        round("c1", "live", new Date("2026-08-26T09:00:00.000Z"), STALE_FETCHED),
+        round("c1", "upcoming", new Date("2026-08-28T09:00:00.000Z")),
+      ],
+    });
+
+    const result = await getOngoingChessTournaments(reader, {
+      countryIso2: "IN",
+      now: NOW,
+    });
+
+    expect(result[0]?.rounds).toEqual({
+      total: 3,
+      // Not credited as played, and not claimed to be under way either.
+      completed: 1,
+      live: 0,
+      liveUnconfirmed: 1,
+      upcoming: 1,
+      // The stale round's own start is not offered as "next".
+      nextStartTime: new Date("2026-08-28T09:00:00.000Z"),
+    });
   });
 });
 
@@ -388,7 +438,10 @@ describe("live games", () => {
   it("asks for live only and leaves an undecided result null", async () => {
     const { reader, calls } = fakeReader({ games: GAMES, sides: SIDES });
 
-    const result = await getLiveChessGames(reader, { countryIso2: "IN" });
+    const result = await getLiveChessGames(reader, {
+      countryIso2: "IN",
+      now: NOW,
+    });
 
     expect(calls[0]?.args).toEqual({
       countryIso2: "IN",
@@ -399,6 +452,7 @@ describe("live games", () => {
     expect(result).toHaveLength(1);
     expect(result[0]?.id).toBe("g2");
     expect(result[0]?.result).toBeNull();
+    expect(result[0]?.liveClaim?.confidence).toBe("confirmed");
     expect(result[0]?.sides.map((s) => `${s.role}:${s.name}`)).toEqual([
       "white:Castellanos Rodriguez, Renier",
       "black:Narayanan S L",
@@ -416,7 +470,10 @@ describe("live games", () => {
       ],
     });
 
-    const result = await getLiveChessGames(reader, { countryIso2: "IN" });
+    const result = await getLiveChessGames(reader, {
+      countryIso2: "IN",
+      now: NOW,
+    });
 
     expect(result[0]?.sides.map((s) => s.name)).toEqual([
       "White Player",
@@ -435,8 +492,137 @@ describe("live games", () => {
   });
 });
 
+/**
+ * The read-time freshness guard. `events.status` is a snapshot written at ingest,
+ * so these tests fix both the stored fetch time and the read clock and assert
+ * what the layer is willing to claim.
+ */
+describe("stale live claims", () => {
+  const freshLive = game("gf", "live", null, new Date("2026-08-31T11:55:00.000Z"));
+  const staleLive = game(
+    "gs",
+    "live",
+    null,
+    new Date("2026-08-31T09:00:00.000Z"),
+    STALE_FETCHED,
+  );
+
+  it("presents a freshly fetched live game as live", async () => {
+    const { reader } = fakeReader({ games: [freshLive] });
+
+    const live = await getLiveChessGames(reader, {
+      countryIso2: "IN",
+      now: NOW,
+    });
+
+    expect(live.map((g) => g.id)).toEqual(["gf"]);
+    expect(live[0]?.liveClaim).toEqual({
+      confidence: "confirmed",
+      lastSeenAt: new Date(FETCHED),
+      ageMs: NOW.getTime() - new Date(FETCHED).getTime(),
+      windowMs: LIVE_FRESHNESS_WINDOW_MS,
+    });
+  });
+
+  it("withholds a live game whose fetch has aged out", async () => {
+    const { reader } = fakeReader({ games: [freshLive, staleLive] });
+
+    const live = await getLiveChessGames(reader, {
+      countryIso2: "IN",
+      now: NOW,
+    });
+
+    expect(live.map((g) => g.id)).toEqual(["gf"]);
+  });
+
+  it("reports the stale row as last seen in progress, with its own feed", async () => {
+    const { reader } = fakeReader({ games: [freshLive, staleLive] });
+
+    const unconfirmed = await getUnconfirmedChessGames(reader, {
+      countryIso2: "IN",
+      now: NOW,
+    });
+
+    expect(unconfirmed.map((g) => g.id)).toEqual(["gs"]);
+    expect(unconfirmed[0]?.liveClaim?.confidence).toBe("unconfirmed");
+    expect(unconfirmed[0]?.liveClaim?.lastSeenAt).toEqual(
+      new Date(STALE_FETCHED),
+    );
+  });
+
+  it("never relabels a stale live game as finished or gives it a result", async () => {
+    const { reader } = fakeReader({ games: [staleLive] });
+
+    const overview = await getChessCountryOverview(reader, {
+      countryIso2: "IN",
+      now: NOW,
+    });
+
+    // Absent from both feeds a reader would read as settled.
+    expect(overview.liveGames).toEqual([]);
+    expect(overview.recentGames.map((g) => g.id)).toEqual([]);
+    expect(overview.unconfirmedGames.map((g) => g.id)).toEqual(["gs"]);
+    const stale = overview.unconfirmedGames[0];
+    // The stored status is passed through verbatim: nothing rewrote the row.
+    expect(stale?.status).toBe("live");
+    expect(stale?.result).toBeNull();
+    expect(stale?.sides.every((s) => s.result === null)).toBe(true);
+  });
+
+  it("splits one page of stored live rows without reading them twice", async () => {
+    const { reader, calls } = fakeReader({ games: [freshLive, staleLive] });
+
+    const overview = await getChessCountryOverview(reader, {
+      countryIso2: "IN",
+      now: NOW,
+    });
+
+    expect(overview.liveGames.map((g) => g.id)).toEqual(["gf"]);
+    expect(overview.unconfirmedGames.map((g) => g.id)).toEqual(["gs"]);
+    // Both feeds come from the single stored-live read.
+    expect(
+      calls.filter(
+        (c) =>
+          c.fn === "games" &&
+          JSON.stringify(c.args["statuses"]) === JSON.stringify(["live"]),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("treats a live row with no usable fetch time as unconfirmed", async () => {
+    const noProvenance: GameRow = { ...freshLive, id: "gx", sources: [] };
+    const { reader } = fakeReader({ games: [noProvenance] });
+
+    expect(
+      await getLiveChessGames(reader, { countryIso2: "IN", now: NOW }),
+    ).toEqual([]);
+    const unconfirmed = await getUnconfirmedChessGames(reader, {
+      countryIso2: "IN",
+      now: NOW,
+    });
+    expect(unconfirmed.map((g) => g.id)).toEqual(["gx"]);
+    expect(unconfirmed[0]?.liveClaim?.lastSeenAt).toBeNull();
+  });
+
+  it("leaves a finished game's status alone, with no live claim", async () => {
+    const { reader } = fakeReader({
+      games: [game("go", "recent", "1-0", null, STALE_FETCHED)],
+    });
+
+    const recent = await getRecentChessGames(reader, {
+      countryIso2: "IN",
+      now: NOW,
+    });
+
+    expect(recent[0]?.status).toBe("recent");
+    expect(recent[0]?.result).toBe("1-0");
+    // The guard only ever qualifies "live"; stale provenance is not a downgrade.
+    expect(recent[0]?.liveClaim).toBeNull();
+  });
+});
+
 describe("country overview", () => {
-  it("fills all four sections in seven reads, sharing the child batches", async () => {
+  it("fills every section in seven reads, sharing the child batches", async () => {
     const { reader, calls } = fakeReader({
       tournaments: TOURNAMENTS,
       gms: GMS,
@@ -448,12 +634,14 @@ describe("country overview", () => {
     const overview = await getChessCountryOverview(reader, {
       countryIso2: "IN",
       limit: 10,
+      now: NOW,
     });
 
     expect(overview.ongoingTournaments.map((t) => t.id)).toEqual(["c1", "c2"]);
     expect(overview.upcomingTournaments.map((t) => t.id)).toEqual(["c3"]);
     expect(overview.recentGames.map((g) => g.id)).toEqual(["g1", "g3"]);
     expect(overview.liveGames.map((g) => g.id)).toEqual(["g2"]);
+    expect(overview.unconfirmedGames).toEqual([]);
 
     // Four parent lists + one batch per child kind, each fetched exactly once.
     expect(calls).toHaveLength(7);
@@ -492,6 +680,7 @@ describe("country overview", () => {
       upcomingTournaments: [],
       recentGames: [],
       liveGames: [],
+      unconfirmedGames: [],
     });
     expect(calls.map((c) => c.fn)).toEqual([
       "tournaments",
@@ -499,6 +688,19 @@ describe("country overview", () => {
       "games",
       "games",
     ]);
+  });
+
+  it("applies the freshness rule through the India wrapper too", async () => {
+    // The wrapper both /india/chess and /api/india/chess call: the guard has to
+    // reach them without either surface asking for it.
+    const { reader } = fakeReader({
+      games: [game("gs", "live", null, null, STALE_FETCHED)],
+    });
+
+    const overview = await getIndiaChessOverview(reader, { now: NOW });
+
+    expect(overview.liveGames).toEqual([]);
+    expect(overview.unconfirmedGames.map((g) => g.id)).toEqual(["gs"]);
   });
 });
 
@@ -532,33 +734,45 @@ describe("pure helpers", () => {
   });
 
   it("assembles a game that has no recorded sides", () => {
-    const [assembled] = assembleGames([game("gz", "upcoming", null)], [], "IN");
+    const [assembled] = assembleGames(
+      [game("gz", "upcoming", null)],
+      [],
+      "IN",
+      NOW,
+    );
     expect(assembled?.sides).toEqual([]);
     expect(assembled?.result).toBeNull();
+    expect(assembled?.liveClaim).toBeNull();
   });
 
   it("reports no round progress rather than zero rounds", () => {
-    expect(summarizeRounds([])).toBeNull();
+    expect(summarizeRounds([], NOW)).toBeNull();
   });
 
   it("prefers an upcoming start only when no round is live", () => {
     expect(
-      summarizeRounds([
-        round("c1", "upcoming", new Date("2026-09-02T09:00:00.000Z")),
-        round("c1", "upcoming", new Date("2026-09-01T09:00:00.000Z")),
-      ]),
+      summarizeRounds(
+        [
+          round("c1", "upcoming", new Date("2026-09-02T09:00:00.000Z")),
+          round("c1", "upcoming", new Date("2026-09-01T09:00:00.000Z")),
+        ],
+        NOW,
+      ),
     ).toEqual({
       total: 2,
       completed: 0,
       live: 0,
+      liveUnconfirmed: 0,
       upcoming: 2,
       nextStartTime: new Date("2026-09-01T09:00:00.000Z"),
     });
   });
 
   it("keeps the next start null when no round has a time", () => {
-    expect(summarizeRounds([round("c1", "live"), round("c1", "upcoming")])
-      ?.nextStartTime).toBeNull();
+    expect(
+      summarizeRounds([round("c1", "live"), round("c1", "upcoming")], NOW)
+        ?.nextStartTime,
+    ).toBeNull();
   });
 
   it("reports the newest fetch across every section", () => {
@@ -569,14 +783,21 @@ describe("pure helpers", () => {
       [],
       [],
       "IN",
+      NOW,
     );
-    const [recent] = assembleGames([game("g1", "recent", "1-0")], [], "IN");
+    const [recent] = assembleGames(
+      [game("g1", "recent", "1-0")],
+      [],
+      "IN",
+      NOW,
+    );
     const empty: ChessCountryOverview = {
       countryIso2: "IN",
       ongoingTournaments: [],
       upcomingTournaments: [],
       recentGames: [],
       liveGames: [],
+      unconfirmedGames: [],
     };
 
     expect(latestFetchedAt(empty)).toBeNull();
@@ -611,5 +832,24 @@ describe("pure helpers", () => {
           : [],
       }),
     ).toBe(newest);
+  });
+
+  it("counts an unconfirmed game when reporting the newest fetch", () => {
+    const [stale] = assembleGames(
+      [game("gs", "live", null, null, STALE_FETCHED)],
+      [],
+      "IN",
+      NOW,
+    );
+    expect(
+      latestFetchedAt({
+        countryIso2: "IN",
+        ongoingTournaments: [],
+        upcomingTournaments: [],
+        recentGames: [],
+        liveGames: [],
+        unconfirmedGames: stale === undefined ? [] : [stale],
+      }),
+    ).toBe(STALE_FETCHED);
   });
 });

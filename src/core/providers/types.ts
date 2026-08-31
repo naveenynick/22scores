@@ -40,6 +40,17 @@ export interface ProviderQuery {
   participantRefs?: string[];
   /** Upper bound on how many competitions a provider should discover. */
   limit?: number;
+  /**
+   * Rows this cycle should re-read directly, as `providerRef` values keyed by the
+   * provider that issued them — so one provider is never handed another's ids.
+   *
+   * Ingestion fills this from provenance already stored (see
+   * `core/ingest/stale-live`), which is how a row that claims to be live can heal
+   * even when discovery no longer ranks its competition highly enough to select
+   * it. Advisory: a provider that cannot address items by id ignores it, and one
+   * that can is still bound by its own request budget.
+   */
+  refreshRefs?: Readonly<Record<string, readonly string[]>>;
 }
 
 export interface SportProvider {

@@ -40,3 +40,6 @@ yarn-error.log*
 .vscode/*
 !.vscode/extensions.json
 .idea/
+
+# local Claude / preview configuration
+.claude/

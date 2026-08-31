@@ -8,6 +8,10 @@ import {
   type LichessTournamentBundle,
 } from "@/core/providers/chess/lichess-mapper";
 import { mergeSources, toSourceRows } from "@/core/ingest/persist";
+import {
+  CHESS_GAME_LINK_LABELS,
+  resolveExternalEventLink,
+} from "@/lib/external-links";
 import type {
   LichessGame,
   LichessRound,
@@ -277,5 +281,56 @@ describe("repeated syncs", () => {
     expect(merged[0]?.fetchedAt).toBe(
       new Date(FETCHED.getTime() + 3_600_000).toISOString(),
     );
+  });
+});
+
+/**
+ * The stored side of the outbound-link contract, proved on real mapper output:
+ * ingestion keeps the round's page as the URL and the board's id in the ref, and
+ * that is exactly what the link layer needs to reach one board out of many.
+ */
+describe("linking a mapped board", () => {
+  const mapped = mapTournament(
+    bundle({
+      rnd1: [
+        { id: "g1", players: [GUKESH, CARLSEN], status: "1-0" },
+        { id: "g2", players: [INDIAN_IM, NOTHING_KNOWN], status: "*" },
+      ],
+    }),
+    NOW,
+  );
+
+  const linkFor = (ref: string, isLive: boolean) => {
+    const event = mapped.events.find((e) => e.sources[0]?.providerRef === ref);
+    return resolveExternalEventLink({
+      sources: (event?.sources ?? []).map((s) => ({
+        provider: s.provider,
+        providerRef: s.providerRef,
+        url: s.url ?? null,
+      })),
+      isLive,
+      labels: CHESS_GAME_LINK_LABELS,
+    });
+  };
+
+  it("stores the round page and the board id, not one merged string", () => {
+    const game = mapped.events.find((e) => e.sources[0]?.providerRef === "rnd1/g1");
+    expect(game?.sources[0]?.url).toBe(ROUND_1.url);
+    expect(game?.sources[0]?.providerRef).toBe("rnd1/g1");
+  });
+
+  it("resolves the two boards of one round to two different URLs", () => {
+    const finished = linkFor("rnd1/g1", false);
+    const live = linkFor("rnd1/g2", true);
+
+    expect(finished?.href).toBe(`${ROUND_1.url}/g1`);
+    expect(live?.href).toBe(`${ROUND_1.url}/g2`);
+    expect(finished?.href).not.toBe(live?.href);
+    expect(finished?.label).toBe("View game");
+    expect(live?.label).toBe("Watch now");
+  });
+
+  it("leaves the round container pointing at the round", () => {
+    expect(linkFor("rnd1", false)?.href).toBe(ROUND_1.url);
   });
 });

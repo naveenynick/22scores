@@ -95,9 +95,11 @@ function GameSkeleton() {
           </div>
         ))}
       </div>
-      <div className="flex items-center justify-between border-t bg-muted/20 px-3 py-2 sm:px-4">
+      <div className="flex items-center gap-3 border-t bg-muted/20 px-3 py-2.5 sm:px-4">
         <Bar className="h-3 w-16" />
         <Bar className="h-3 w-24" />
+        {/* Outbound action, present whenever the game has a trusted source. */}
+        <Bar className="ml-auto h-8 w-24 rounded-md" />
       </div>
     </div>
   );

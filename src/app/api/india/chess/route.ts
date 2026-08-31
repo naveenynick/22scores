@@ -6,10 +6,17 @@ import { getDb } from "@/lib/db";
 /**
  * GET /api/india/chess — read-only India chess board.
  *
- * Returns four clearly separated sections (ongoingTournaments,
- * upcomingTournaments, recentGames, liveGames) built from data already in
- * Supabase. No provider is contacted here: ingestion is a separate path, so a
- * Lichess outage cannot affect this endpoint or change what it returns.
+ * Returns five clearly separated sections (ongoingTournaments,
+ * upcomingTournaments, recentGames, liveGames, unconfirmedGames) built from data
+ * already in Supabase. No provider is contacted here: ingestion is a separate
+ * path, so a Lichess outage cannot affect this endpoint or change what it
+ * returns.
+ *
+ * `liveGames` and `unconfirmedGames` come from the same read-time freshness rule
+ * the page uses — one call to `getIndiaChessOverview`, so the two surfaces can
+ * never disagree about what is live. A game stored as live whose provenance has
+ * gone stale appears in `unconfirmedGames` with a `liveClaim` explaining when it
+ * was last seen; it is never moved into `recentGames` and never given a result.
  *
  * Public and unauthenticated by design — everything it exposes is public sports
  * data. Add auth before returning anything user-specific through it.
@@ -31,25 +38,32 @@ function parseLimit(raw: string | null): number {
 
 export async function GET(request: Request): Promise<NextResponse> {
   const limit = parseLimit(new URL(request.url).searchParams.get("limit"));
+  // One clock for the freshness decision and for what the response says it is.
+  const generatedAt = new Date();
 
   try {
-    const overview = await getIndiaChessOverview(getDb(), { limit });
+    const overview = await getIndiaChessOverview(getDb(), {
+      limit,
+      now: generatedAt,
+    });
     return NextResponse.json(
       {
         country: INDIA_ISO2,
         sport: "chess",
-        generatedAt: new Date().toISOString(),
+        generatedAt: generatedAt.toISOString(),
         limit,
         counts: {
           ongoingTournaments: overview.ongoingTournaments.length,
           upcomingTournaments: overview.upcomingTournaments.length,
           recentGames: overview.recentGames.length,
           liveGames: overview.liveGames.length,
+          unconfirmedGames: overview.unconfirmedGames.length,
         },
         ongoingTournaments: overview.ongoingTournaments,
         upcomingTournaments: overview.upcomingTournaments,
         recentGames: overview.recentGames,
         liveGames: overview.liveGames,
+        unconfirmedGames: overview.unconfirmedGames,
       },
       { headers: { "Cache-Control": "no-store" } },
     );

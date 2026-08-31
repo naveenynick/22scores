@@ -9,6 +9,7 @@ function progress(
   return {
     completed: 0,
     live: 0,
+    liveUnconfirmed: 0,
     upcoming: 0,
     nextStartTime: null,
     ...overrides,
@@ -29,6 +30,25 @@ describe("roundSegments", () => {
       "upcoming",
       "upcoming",
     ]);
+  });
+
+  it("draws a round last seen live apart from played and upcoming ones", () => {
+    // Neither "completed" nor "live": the bar must not imply the round was
+    // played, nor that it is being played now.
+    expect(
+      roundSegments(
+        progress({ total: 4, completed: 2, liveUnconfirmed: 1, upcoming: 1 }),
+      ),
+    ).toEqual(["completed", "completed", "live-unconfirmed", "upcoming"]);
+  });
+
+  it("counts an unconfirmed round towards the total", () => {
+    expect(
+      roundSegments(progress({ total: 2, completed: 1, liveUnconfirmed: 1 })),
+    ).toEqual(["completed", "live-unconfirmed"]);
+    // One short: the unconfirmed round is not silently folded into another bucket.
+    expect(roundSegments(progress({ total: 3, completed: 1, liveUnconfirmed: 1 })))
+      .toBeNull();
   });
 
   it("draws a single-round tournament", () => {

@@ -5,9 +5,22 @@ import { cn } from "@/lib/utils";
  * honest empty message. `emptyMessage` says why a section is empty in terms of
  * the data, never "no results found".
  *
- * `tone="live"` only changes the accent on the heading rule — the words carry the
+ * `tone` only changes the accent on the heading rule — the words carry the
  * meaning, so nothing depends on the colour.
  */
+
+/**
+ * Shared by the section heading and its jump link so both describe a section the
+ * same way. "unconfirmed" marks something the data claims but cannot confirm.
+ */
+export type SectionTone = "default" | "live" | "unconfirmed";
+
+const TONE_RULE: Record<SectionTone, string> = {
+  default: "bg-foreground/70",
+  live: "bg-rose-600",
+  unconfirmed: "bg-amber-500",
+};
+
 export function Section({
   id,
   title,
@@ -27,7 +40,7 @@ export function Section({
   emptyMessage: string;
   /** Optional right-aligned note, e.g. a unit or a scope reminder. */
   meta?: string;
-  tone?: "default" | "live";
+  tone?: SectionTone;
   className?: string;
   children: React.ReactNode;
 }) {
@@ -41,10 +54,7 @@ export function Section({
       <div className="mb-3 flex items-center gap-2.5">
         <span
           aria-hidden="true"
-          className={cn(
-            "h-4 w-1 shrink-0 rounded-full",
-            tone === "live" ? "bg-rose-600" : "bg-foreground/70",
-          )}
+          className={cn("h-4 w-1 shrink-0 rounded-full", TONE_RULE[tone])}
         />
         <h2
           id={headingId}

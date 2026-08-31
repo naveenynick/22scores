@@ -138,4 +138,13 @@ describe("child batch SQL", () => {
     expect(sql).toContain('"events"."start_time" asc nulls last');
     expect(isReadOnly(sql)).toBe(true);
   });
+
+  it("reads a round's provenance so the freshness rule can judge it", () => {
+    // Without `sources` a round stored as live could never be checked, and the
+    // tournament would advertise a round in progress forever.
+    const { sql } = competitionRoundsQuery(db, {
+      competitionIds: ["c1"],
+    }).toSQL();
+    expect(sql).toMatch(/select .*"sources".* from "events"/);
+  });
 });

@@ -4,7 +4,7 @@ import { DataFreshness } from "@/components/chess/data-freshness";
 import { GameCard } from "@/components/chess/game-card";
 import { CHESS_SHELL as SHELL } from "@/components/chess/layout";
 import { RetryButton } from "@/components/chess/retry-button";
-import { Section } from "@/components/chess/section";
+import { Section, type SectionTone } from "@/components/chess/section";
 import { TournamentCard } from "@/components/chess/tournament-card";
 import {
   getIndiaChessOverview,
@@ -27,7 +27,9 @@ import { cn } from "@/lib/utils";
  * first, then the tournaments behind it, with results alongside on a wide screen.
  *
  * Nothing on screen is invented: a missing date, entrant, round or result is
- * rendered as absent, and no provider name or link is shown to the reader.
+ * rendered as absent, and no provider name or link is shown to the reader. A
+ * stored live game the query layer could not confirm gets its own section rather
+ * than being shown as live or as finished.
  */
 
 /** Never prerender or cache. */
@@ -39,6 +41,9 @@ const PAGE_DESCRIPTION =
   "Live and recent games from Indian Grandmasters, with the tournaments they are playing now and the ones coming up next. Times in IST.";
 /** Adjective used for the country in headings, e.g. "Indian Grandmasters". */
 const COUNTRY_LABEL = "Indian";
+
+/** Named once so the jump link and the section it targets cannot drift apart. */
+const UNCONFIRMED_SECTION_ID = "unconfirmed-games";
 
 const site = resolveSiteUrl();
 
@@ -76,9 +81,11 @@ type LoadResult =
   | { ok: true; overview: ChessCountryOverview }
   | { ok: false };
 
-async function loadOverview(): Promise<LoadResult> {
+async function loadOverview(now: Date): Promise<LoadResult> {
   try {
-    return { ok: true, overview: await getIndiaChessOverview(getDb()) };
+    // One clock for the whole page: the freshness guard, the "updated" line and
+    // every relative time then agree with each other.
+    return { ok: true, overview: await getIndiaChessOverview(getDb(), { now }) };
   } catch (error) {
     // Class of failure only: a driver error can carry the connection target.
     console.error(
@@ -91,7 +98,7 @@ async function loadOverview(): Promise<LoadResult> {
 
 export default async function IndiaChessPage() {
   const generatedAt = new Date();
-  const result = await loadOverview();
+  const result = await loadOverview(generatedAt);
 
   return (
     <main className="min-h-screen pb-16">
@@ -137,7 +144,7 @@ export default async function IndiaChessPage() {
   );
 }
 
-/** The four sections, ordered by how urgent they are to a reader. */
+/** The sections, ordered by how urgent they are to a reader. */
 function Board({
   overview,
   generatedAt,
@@ -145,27 +152,44 @@ function Board({
   overview: ChessCountryOverview;
   generatedAt: Date;
 }) {
-  const { ongoingTournaments, upcomingTournaments, liveGames, recentGames } =
-    overview;
-  const links = [
-    { id: "live-games", label: "Live", count: liveGames.length, live: true },
+  const {
+    ongoingTournaments,
+    upcomingTournaments,
+    liveGames,
+    unconfirmedGames,
+    recentGames,
+  } = overview;
+  const links: SectionLinkProps[] = [
+    { id: "live-games", label: "Live", count: liveGames.length, tone: "live" },
+    // Offered only when there is something to jump to: an always-present
+    // "Last seen live 0" would advertise a state meant to be rare.
+    ...(unconfirmedGames.length > 0
+      ? [
+          {
+            id: UNCONFIRMED_SECTION_ID,
+            label: "Last seen live",
+            count: unconfirmedGames.length,
+            tone: "unconfirmed" as const,
+          },
+        ]
+      : []),
     {
       id: "ongoing-tournaments",
       label: "Ongoing",
       count: ongoingTournaments.length,
-      live: false,
+      tone: "default",
     },
     {
       id: "upcoming-tournaments",
       label: "Upcoming",
       count: upcomingTournaments.length,
-      live: false,
+      tone: "default",
     },
     {
       id: "recent-games",
       label: "Results",
       count: recentGames.length,
-      live: false,
+      tone: "default",
     },
   ];
   const total = links.reduce((sum, link) => sum + link.count, 0);
@@ -213,6 +237,40 @@ function Board({
             ))}
           </ul>
         </Section>
+
+        {/*
+          Games the database still calls live but whose provenance has gone stale.
+          Held apart from both neighbours on purpose: listing them under "Live
+          games" would assert play that cannot be confirmed, and listing them
+          under "Recent results" would imply they are over. Rendered only when
+          there are any — see `@/core/queries/freshness`.
+        */}
+        {unconfirmedGames.length > 0 && (
+          <Section
+            id={UNCONFIRMED_SECTION_ID}
+            tone="unconfirmed"
+            className="mt-8"
+            title="Last seen in progress"
+            count={unconfirmedGames.length}
+            meta="Awaiting the next update"
+            emptyMessage="Every game in progress is currently confirmed."
+          >
+            <ul
+              className={cn(
+                "grid gap-3",
+                unconfirmedGames.length > 1 && "md:grid-cols-2",
+              )}
+            >
+              {unconfirmedGames.map((game) => (
+                <GameCard
+                  key={game.id}
+                  game={game}
+                  countryIso2={overview.countryIso2}
+                />
+              ))}
+            </ul>
+          </Section>
+        )}
 
         <div className="mt-8 grid gap-8 lg:mt-10 lg:grid-cols-3">
           <div className="space-y-8 lg:col-span-2">
@@ -283,40 +341,49 @@ function Board({
   );
 }
 
-/** Jump link with a live count. Horizontally scrollable on a phone. */
-function SectionLink({
-  id,
-  label,
-  count,
-  live,
-}: {
+interface SectionLinkProps {
   id: string;
   label: string;
   count: number;
-  live: boolean;
-}) {
-  const isLive = live && count > 0;
+  tone: SectionTone;
+}
+
+/**
+ * Jump link carrying the section's count. Horizontally scrollable on a phone.
+ * The accent matches the section's heading rule; the label and number carry the
+ * meaning on their own.
+ */
+function SectionLink({ id, label, count, tone }: SectionLinkProps) {
+  // An accent for an empty section would draw the eye to nothing.
+  const accent = count === 0 ? "default" : tone;
   return (
     <a
       href={`#${id}`}
       className={cn(
         "inline-flex shrink-0 items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-        isLive
-          ? "border-rose-200 bg-rose-50 text-rose-800"
-          : "bg-card hover:bg-accent",
+        accent === "live" && "border-rose-200 bg-rose-50 text-rose-800",
+        accent === "unconfirmed" && "border-amber-200 bg-amber-50 text-amber-900",
+        accent === "default" && "bg-card hover:bg-accent",
       )}
     >
-      {isLive && (
+      {accent !== "default" && (
         <span
           aria-hidden="true"
-          className="size-1.5 rounded-full bg-rose-600"
+          className={cn(
+            "size-1.5 rounded-full",
+            accent === "live" ? "bg-rose-600" : "bg-amber-500",
+          )}
         />
       )}
       {label}
       <span
         className={cn(
           "tabular-nums",
-          isLive ? "text-rose-700/80" : "text-muted-foreground",
+          accent === "live"
+            ? "text-rose-700/80"
+            : accent === "unconfirmed"
+              ? "text-amber-800/80"
+              : "text-muted-foreground",
         )}
       >
         {count}

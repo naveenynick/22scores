@@ -19,6 +19,8 @@ const badgeVariants = cva(
         ongoing: "bg-emerald-50 text-emerald-800 ring-1 ring-emerald-700/25",
         upcoming: "bg-sky-50 text-sky-900 ring-1 ring-sky-700/25",
         final: "bg-slate-100 text-slate-700 ring-1 ring-slate-900/10",
+        /** Something the data claims but can no longer confirm. */
+        unconfirmed: "bg-amber-50 text-amber-900 ring-1 ring-amber-700/30",
         neutral: "bg-secondary text-secondary-foreground ring-1 ring-border",
         /** Highest-contrast marker, used where colour would compete with status. */
         solid: "bg-foreground text-background",
