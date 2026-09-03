@@ -13,7 +13,10 @@ const envSchema = z.object({
   NEXT_PUBLIC_SITE_URL: z.string().url().default("http://localhost:3000"),
 
   // Provider credentials — optional; unused until ingestion is implemented.
+  // Optional so `next build` and the chess paths (Lichess needs no key) keep
+  // working on a machine that has no cricket credentials configured.
   THESPORTSDB_API_KEY: z.string().optional(),
+  CRICKETDATA_API_KEY: z.string().optional(),
   PROVIDER_CONTACT_USER_AGENT: z
     .string()
     .default("22scores (contact: you@example.com)"),
